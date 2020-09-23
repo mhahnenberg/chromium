@@ -67,7 +67,8 @@ IdleHelper::Delegate::Delegate() = default;
 IdleHelper::Delegate::~Delegate() = default;
 
 scoped_refptr<SingleThreadIdleTaskRunner> IdleHelper::IdleTaskRunner() {
-  helper_->CheckOnValidThread();
+  // TODO(binast): Do we actually need to do this check? See https://codereview.chromium.org/904593002 for the original reasonsing.
+  // helper_->CheckOnValidThread();
   return idle_task_runner_;
 }
 

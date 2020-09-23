@@ -388,14 +388,14 @@ Bind(FunctionType&& function, BoundParameters&&... bound_parameters) {
                 "A bound argument uses a bad pattern.");
   auto cb = base::BindOnce(std::forward<FunctionType>(function),
                            std::forward<BoundParameters>(bound_parameters)...);
-#if DCHECK_IS_ON()
-  using UnboundRunType =
-      base::MakeUnboundRunType<FunctionType, BoundParameters...>;
-  using WrapperType =
-      ThreadCheckingCallbackWrapper<base::OnceCallback<UnboundRunType>>;
-  cb = base::BindOnce(&WrapperType::Run,
-                      std::make_unique<WrapperType>(std::move(cb)));
-#endif
+// #if DCHECK_IS_ON()
+//   using UnboundRunType =
+//       base::MakeUnboundRunType<FunctionType, BoundParameters...>;
+//   using WrapperType =
+//       ThreadCheckingCallbackWrapper<base::OnceCallback<UnboundRunType>>;
+//   cb = base::BindOnce(&WrapperType::Run,
+//                       std::make_unique<WrapperType>(std::move(cb)));
+// #endif
   return cb;
 }
 

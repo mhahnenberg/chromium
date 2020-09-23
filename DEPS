@@ -186,7 +186,7 @@ vars = {
   # Three lines of non-changing comments so that
   # the commit queue can handle CLs rolling V8
   # and whatever else without interference from each other.
-  'v8_revision': '9912e35d594bf00cd78697889beff6b238ebe66d',
+  'v8_revision': '488bf7f91c94b466a67ab527dc2694fb35db32d2',
   # Three lines of non-changing comments so that
   # the commit queue can handle CLs rolling swarming_client
   # and whatever else without interference from each other.
@@ -1521,7 +1521,7 @@ deps = {
     Var('chromium_git') + '/infra/luci/client-py.git' + '@' +  Var('swarming_revision'),
 
   'src/v8':
-    Var('chromium_git') + '/v8/v8.git' + '@' +  Var('v8_revision'),
+    'https://github.com/mhahnenberg/v8.git' + '@' +  Var('v8_revision'),
 
   'src-internal': {
     'url': 'https://chrome-internal.googlesource.com/chrome/src-internal.git@675551d57710b6fa74f467ff8bce3be9bc0b0fdb',
