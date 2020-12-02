@@ -46,7 +46,7 @@ class CONTENT_EXPORT StartupTaskRunner {
   void AddTask(StartupTask callback);
 
   // Start running the tasks asynchronously.
-  void StartRunningTasksAsync();
+  void StartRunningTasksAsync(bool throttled = false);
 
   // Run all tasks, or all remaining tasks, synchronously
   void RunAllTasksNow();

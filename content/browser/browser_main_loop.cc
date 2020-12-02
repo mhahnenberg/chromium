@@ -246,8 +246,28 @@
 #undef DestroyAll
 #endif
 
+#include <android/trace.h>
+#include <dlfcn.h>
+
 namespace content {
 namespace {
+
+void *(*ATrace_beginSection) (const char* sectionName);
+void *(*ATrace_endSection) (void);
+
+typedef void *(*fp_ATrace_beginSection) (const char* sectionName);
+typedef void *(*fp_ATrace_endSection) (void);
+
+class ScopedTrace {
+  public:
+    inline ScopedTrace(const char *name) {
+      ATrace_beginSection(name);
+    }
+
+    inline ~ScopedTrace() {
+      ATrace_endSection();
+    }
+};
 
 #if defined(USE_GLIB)
 static void GLibLogHandler(const gchar* log_domain,
@@ -789,6 +809,7 @@ void BrowserMainLoop::PostMainMessageLoopStart() {
 
 int BrowserMainLoop::PreCreateThreads() {
   TRACE_EVENT0("startup", "BrowserMainLoop::PreCreateThreads");
+  ScopedTrace st1("BrowserMainLoop::PreCreateThreads");
 
   // Make sure no accidental call to initialize GpuDataManager earlier.
   DCHECK(!GpuDataManagerImpl::Initialized());
@@ -873,6 +894,19 @@ void BrowserMainLoop::CreateStartupTasks() {
   startup_task_runner_ = std::make_unique<StartupTaskRunner>(
       base::BindOnce(&BrowserStartupComplete),
       GetUIThreadTaskRunner({BrowserTaskType::kBootstrap}));
+
+  void *lib = dlopen("libandroid.so", RTLD_NOW || RTLD_LOCAL);
+  if (lib != NULL) {
+    // Use dlsym() to prevent crashes on devices running Android 5.1
+    // (API level 22) or lower.
+    ATrace_beginSection = reinterpret_cast<fp_ATrace_beginSection>(
+        dlsym(lib, "ATrace_beginSection"));
+    ATrace_endSection = reinterpret_cast<fp_ATrace_endSection>(
+        dlsym(lib, "ATrace_endSection"));
+  } else {
+    (void)*(void**)0x0;
+  }
+  ScopedTrace st1("BrowserMainLoop::CreateStartupTasks");
 #else
   startup_task_runner_ = std::make_unique<StartupTaskRunner>(
       base::OnceCallback<void(int)>(), base::ThreadTaskRunnerHandle::Get());
@@ -898,7 +932,8 @@ void BrowserMainLoop::CreateStartupTasks() {
   startup_task_runner_->AddTask(std::move(pre_main_message_loop_run));
 
 #if defined(OS_ANDROID)
-  startup_task_runner_->StartRunningTasksAsync();
+  bool throttled = true;
+  startup_task_runner_->StartRunningTasksAsync(throttled);
 #else
   startup_task_runner_->RunAllTasksNow();
 #endif
@@ -929,6 +964,7 @@ void BrowserMainLoop::SynchronouslyFlushStartupTasks() {
 
 int BrowserMainLoop::CreateThreads() {
   TRACE_EVENT0("startup,rail", "BrowserMainLoop::CreateThreads");
+  ScopedTrace st1("BrowserMainLoop::CreateThreads");
 
   // Release the ThreadPool's threads.
   scoped_execution_fence_.reset();
@@ -966,6 +1002,7 @@ int BrowserMainLoop::CreateThreads() {
 }
 
 int BrowserMainLoop::PostCreateThreads() {
+  ScopedTrace st1("BrowserMainLoop::PostCreateThreads");
   tracing_controller_ = std::make_unique<content::TracingControllerImpl>();
   content::BackgroundTracingManagerImpl::GetInstance()
       ->AddMetadataGeneratorFunction();
@@ -980,14 +1017,19 @@ int BrowserMainLoop::PostCreateThreads() {
 
 int BrowserMainLoop::PreMainMessageLoopRun() {
 #if defined(OS_ANDROID)
-  bool use_display_wide_color_gamut =
-      GetContentClient()->browser()->GetWideColorGamutHeuristic() ==
-      ContentBrowserClient::WideColorGamutHeuristic::kUseDisplay;
-  // Let screen instance be overridable by parts.
-  ui::SetScreenAndroid(use_display_wide_color_gamut);
+  ScopedTrace st1("BrowserMainLoop::PreMainMessageLoopRun");
+  {
+    ScopedTrace st2("BrowserMainLoop::use_display_wide_color_gamut");
+    bool use_display_wide_color_gamut =
+        GetContentClient()->browser()->GetWideColorGamutHeuristic() ==
+        ContentBrowserClient::WideColorGamutHeuristic::kUseDisplay;
+    // Let screen instance be overridable by parts.
+    ui::SetScreenAndroid(use_display_wide_color_gamut);
+  }
 #endif
 
   if (parts_) {
+    ScopedTrace st3("BrowserMainLoop::parts::PreMainMessageLoopRun");
     TRACE_EVENT0("startup", "BrowserMainLoop::PreMainMessageLoopRun");
 
     parts_->PreMainMessageLoopRun();
@@ -1194,6 +1236,7 @@ void BrowserMainLoop::InitializeMainThread() {
 
 int BrowserMainLoop::BrowserThreadsStarted() {
   TRACE_EVENT0("startup", "BrowserMainLoop::BrowserThreadsStarted");
+  ScopedTrace st1("BrowserMainLoop::BrowserThreadsStarted");
 
   // Bring up Mojo IPC and the embedded Service Manager as early as possible.
   // Initializaing mojo requires the IO thread to have been initialized first,

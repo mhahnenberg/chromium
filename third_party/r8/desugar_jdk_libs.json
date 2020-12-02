@@ -35,7 +35,6 @@
         "java.util.function.DoubleToIntFunction",
         "java.util.function.DoubleToLongFunction",
         "java.util.function.DoubleUnaryOperator",
-        "java.util.function.Function",
         "java.util.function.IntBinaryOperator",
         "java.util.function.IntConsumer",
         "java.util.function.IntFunction",
@@ -104,7 +103,6 @@
         "j$.util.IntSummaryStatistics": "java.util.IntSummaryStatistics",
         "j$.util.DoubleSummaryStatistics": "java.util.DoubleSummaryStatistics",
         "java.util.stream.": "j$.util.stream.",
-        "java.util.function.": "j$.util.function.",
         "java.util.Comparators": "j$.util.Comparators",
         "java.util.DoubleSummaryStatistics": "j$.util.DoubleSummaryStatistics",
         "java.util.IntSummaryStatistics": "j$.util.IntSummaryStatistics",
@@ -180,7 +178,6 @@
       "api_level_below_or_equal": 23,
       "rewrite_prefix": {
         "java.util.stream.": "j$.util.stream.",
-        "java.util.function.": "j$.util.function.",
         "java.util.DoubleSummaryStatistics": "j$.util.DoubleSummaryStatistics",
         "java.util.IntSummaryStatistics": "j$.util.IntSummaryStatistics",
         "java.util.LongSummaryStatistics": "j$.util.LongSummaryStatistics",

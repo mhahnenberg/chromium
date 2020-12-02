@@ -7,6 +7,8 @@ package org.chromium.content_public.browser;
 import org.chromium.base.library_loader.LibraryProcessType;
 import org.chromium.content.browser.BrowserStartupControllerImpl;
 
+import java.util.concurrent.CompletableFuture;
+
 /**
  * This class controls how C++ browser main loop is started and ensures it happens only once.
  *
@@ -69,6 +71,22 @@ public interface BrowserStartupController {
      *                      the browser process
      */
     void startBrowserProcessesSync(
+            @LibraryProcessType int libraryProcessType, boolean singleProcess);
+
+    /**
+     * Start the browser process asynchronously.
+     *
+     * <p/>
+     * Note that this can only be called on the UI thread.
+     *
+     * @param libraryProcessType the type of process the shared library is loaded. It must be
+     *                           LibraryProcessType.PROCESS_BROWSER,
+     *                           LibraryProcessType.PROCESS_WEBVIEW or
+     *                           LibraryProcessType.PROCESS_WEBLAYER.
+     * @param singleProcess true iff the browser should run single-process, ie. keep renderers in
+     *                      the browser process
+     */
+    CompletableFuture<Void> startBrowserProcessesIncrementallyAsync(
             @LibraryProcessType int libraryProcessType, boolean singleProcess);
 
     /**

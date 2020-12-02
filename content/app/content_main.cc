@@ -205,8 +205,40 @@ void InitializeMojo(mojo::core::Configuration* config) {
 
 }  // namespace
 
+#include <android/trace.h>
+#include <dlfcn.h>
+
+void *(*ATrace_beginSection) (const char* sectionName);
+void *(*ATrace_endSection) (void);
+
+typedef void *(*fp_ATrace_beginSection) (const char* sectionName);
+typedef void *(*fp_ATrace_endSection) (void);
+
+class ScopedTrace {
+  public:
+    inline ScopedTrace(const char *name) {
+      ATrace_beginSection(name);
+    }
+
+    inline ~ScopedTrace() {
+      ATrace_endSection();
+    }
+};
+
 int RunContentProcess(const ContentMainParams& params,
                       ContentMainRunner* content_main_runner) {
+  void *lib = dlopen("libandroid.so", RTLD_NOW || RTLD_LOCAL);
+  if (lib != NULL) {
+    // Use dlsym() to prevent crashes on devices running Android 5.1
+    // (API level 22) or lower.
+    ATrace_beginSection = reinterpret_cast<fp_ATrace_beginSection>(
+        dlsym(lib, "ATrace_beginSection"));
+    ATrace_endSection = reinterpret_cast<fp_ATrace_endSection>(
+        dlsym(lib, "ATrace_endSection"));
+  } else {
+    (void)*(void**)0x0;
+  }
+  ScopedTrace st0("RunContentProcess::ContentMainParams");
   ContentMainParams content_main_params(params);
 
   int exit_code = -1;
@@ -227,7 +259,10 @@ int RunContentProcess(const ContentMainParams& params,
 #if defined(OS_MAC) && BUILDFLAG(USE_ALLOCATOR_SHIM)
     base::allocator::InitializeAllocatorShim();
 #endif
-    base::EnableTerminationOnOutOfMemory();
+    {
+      ScopedTrace st1("RunContentProcess::EnableTerminationOnOutOfMemory");
+      base::EnableTerminationOnOutOfMemory();
+    }
 
 #if defined(OS_LINUX) || defined(OS_CHROMEOS)
     // The various desktop environments set this environment variable that
@@ -303,14 +338,26 @@ int RunContentProcess(const ContentMainParams& params,
     content_main_params.autorelease_pool = autorelease_pool.get();
     InitializeMac();
 #endif
-
     mojo::core::Configuration mojo_config;
-    mojo_config.max_message_num_bytes = kMaximumMojoMessageSize;
-    InitializeMojo(&mojo_config);
+    {
+      ScopedTrace st1("RunContentProcess::initMojo");
+      mojo_config.max_message_num_bytes = kMaximumMojoMessageSize;
+      InitializeMojo(&mojo_config);
+    }
 
-    ui::RegisterPathProvider();
-    tracker = base::debug::GlobalActivityTracker::Get();
-    exit_code = content_main_runner->Initialize(content_main_params);
+    {
+      ScopedTrace st1("RunContentProcess::registerPathProvider");
+      ui::RegisterPathProvider();
+    }
+    {
+      ScopedTrace st1("RunContentProcess::getActivityTracker");
+      tracker = base::debug::GlobalActivityTracker::Get();
+    }
+
+    {
+      ScopedTrace st1("RunContentProcess::initialize");
+      exit_code = content_main_runner->Initialize(content_main_params);
+    }
 
     if (exit_code >= 0) {
       if (tracker) {
@@ -332,21 +379,24 @@ int RunContentProcess(const ContentMainParams& params,
     // sandboxed process. The defines below must be in sync with the
     // implementation of mojo::NodeController::CreateSharedBuffer().
 #if !defined(OS_MAC) && !defined(OS_NACL_SFI) && !defined(OS_FUCHSIA)
-    if (sandbox::policy::IsUnsandboxedSandboxType(
-            sandbox::policy::SandboxTypeFromCommandLine(
-                *base::CommandLine::ForCurrentProcess()))) {
-      // Unsandboxed processes don't need shared memory brokering... because
-      // they're not sandboxed.
-    } else if (mojo_config.force_direct_shared_memory_allocation) {
-      // Don't bother with hooks if direct shared memory allocation has been
-      // requested.
-    } else {
-      // Sanity check, since installing the shared memory hooks in a broker
-      // process will lead to infinite recursion.
-      DCHECK(!mojo_config.is_broker_process);
-      // Otherwise, this is a sandboxed process that will need brokering to
-      // allocate shared memory.
-      mojo::SharedMemoryUtils::InstallBaseHooks();
+    {
+      ScopedTrace st1("RunContentProcess::installSharedMemoryHooks");
+      if (sandbox::policy::IsUnsandboxedSandboxType(
+              sandbox::policy::SandboxTypeFromCommandLine(
+                  *base::CommandLine::ForCurrentProcess()))) {
+        // Unsandboxed processes don't need shared memory brokering... because
+        // they're not sandboxed.
+      } else if (mojo_config.force_direct_shared_memory_allocation) {
+        // Don't bother with hooks if direct shared memory allocation has been
+        // requested.
+      } else {
+        // Sanity check, since installing the shared memory hooks in a broker
+        // process will lead to infinite recursion.
+        DCHECK(!mojo_config.is_broker_process);
+        // Otherwise, this is a sandboxed process that will need brokering to
+        // allocate shared memory.
+        mojo::SharedMemoryUtils::InstallBaseHooks();
+      }
     }
 #endif  // !defined(OS_MAC) && !defined(OS_NACL_SFI) && !defined(OS_FUCHSIA)
 
@@ -367,9 +417,14 @@ int RunContentProcess(const ContentMainParams& params,
     }
   }
 
-  if (IsSubprocess())
+  if (IsSubprocess()) {
+    ScopedTrace st1("RunContentProcess::commonSubprocessInit");
     CommonSubprocessInit();
-  exit_code = content_main_runner->Run(params.minimal_browser_mode);
+  }
+  {
+    ScopedTrace st1("RunContentProcess::content_main_runner::Run");
+    exit_code = content_main_runner->Run(params.minimal_browser_mode);
+  }
 
   if (tracker) {
     if (exit_code == 0) {

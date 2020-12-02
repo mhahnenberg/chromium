@@ -4,10 +4,16 @@
 
 package com.android.webview.chromium;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
+import java.util.function.BiFunction;
+
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
 import android.util.Log;
@@ -50,6 +56,7 @@ import org.chromium.base.TraceEvent;
 import org.chromium.base.library_loader.LibraryLoader;
 import org.chromium.base.metrics.RecordHistogram;
 import org.chromium.base.metrics.ScopedSysTraceEvent;
+import org.chromium.base.task.ChoreographedExecutor;
 import org.chromium.base.task.PostTask;
 import org.chromium.content_public.browser.UiThreadTaskTraits;
 import org.chromium.net.NetworkChangeNotifier;
@@ -90,6 +97,8 @@ public class WebViewChromiumAwInit {
 
     // Read/write protected by mLock.
     private boolean mStarted;
+    private boolean mHasInitStarted;
+    private boolean mHasInitCompleted;
     private Looper mFirstWebViewConstructedOn;
 
     private final WebViewChromiumFactoryProvider mFactory;
@@ -135,9 +144,27 @@ public class WebViewChromiumAwInit {
             // return paths. (Other threads will not wake-up until we release |mLock|, whatever).
             mLock.notifyAll();
 
-            if (mStarted) {
+            if (mHasInitCompleted) {
+                assert mStarted;
                 return;
             }
+
+            // In the case of racing with an already-started init process, we need to wait until everything
+            // is done before returning.
+            if (mHasInitStarted) {
+                assert !mStarted;
+                while (!mHasInitCompleted) {
+                    try {
+                        // Important: wait() releases |mLock| the UI thread can take it :-)
+                        mLock.wait();
+                    } catch (InterruptedException e) {
+                        // Keep trying... eventually the UI thread will finish the initialization.
+                    }
+                }
+                assert mStarted;
+                return;
+            }
+            mHasInitStarted = true;
 
             final Context context = ContextUtils.getApplicationContext();
 
@@ -161,7 +188,6 @@ public class WebViewChromiumAwInit {
 
             initPlatSupportLibrary();
             doNetworkInitializations(context);
-
             waitUntilSetUpResources();
 
             // NOTE: Finished writing Java resources. From this point on, it's safe to use them.
@@ -203,6 +229,140 @@ public class WebViewChromiumAwInit {
             if (CommandLine.getInstance().hasSwitch(AwSwitches.WEBVIEW_VERBOSE_LOGGING)) {
                 logCommandLineAndActiveTrials();
             }
+
+            mHasInitCompleted = true;
+        }
+    }
+
+    protected CompletableFuture<Void> startChromiumIncrementallyAsync() {
+        try (ScopedSysTraceEvent e1 = ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync")) {
+            assert ThreadUtils.runningOnUiThread();
+            assert Thread.holdsLock(mLock);
+
+            if (mHasInitCompleted) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            // TODO: Handle if init fails.
+            // In the case of racing with an already-started init process, we need to wait until everything
+            // is done before returning.
+            if (mHasInitStarted) {
+                assert !mHasInitCompleted;
+                while (!mHasInitCompleted) {
+                    try {
+                        // Important: wait() releases |mLock| the UI thread can take it :-)
+                        mLock.wait();
+                    } catch (InterruptedException e) {
+                        // Keep trying... eventually the UI thread will finish the initialization.
+                    }
+                }
+                
+                return CompletableFuture.completedFuture(null);
+            }
+            mHasInitStarted = true;
+
+            final Context context = ContextUtils.getApplicationContext();
+
+            Executor uiThreadExecutor = ChoreographedExecutor.getInstance(ThreadUtils.getUiThreadHandler());
+
+            return CompletableFuture.runAsync(() -> {
+                try (ScopedSysTraceEvent e2 =
+                            ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync.rewriteJavaResources")) {
+                    assert ThreadUtils.runningOnUiThread();
+                    synchronized (mLock) {
+                        JNIUtils.setClassLoader(WebViewChromiumAwInit.class.getClassLoader());
+
+                        ResourceBundle.setAvailablePakLocales(
+                                new String[] {}, AwLocaleConfig.getWebViewSupportedPakLocales());
+
+                        BundleUtils.setIsBundle(ProductConfig.IS_BUNDLE);
+
+                        // We are rewriting Java resources in the background.
+                        // NOTE: Any reference to Java resources will cause a crash.
+
+                        try (ScopedSysTraceEvent e =
+                                        ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.LibraryLoader")) {
+                            LibraryLoader.getInstance().ensureInitialized();
+                        }
+
+                        PathService.override(PathService.DIR_MODULE, "/system/lib/");
+                        PathService.override(DIR_RESOURCE_PAKS_ANDROID, "/system/framework/webview/paks");
+
+                        initPlatSupportLibrary();
+                    }
+                }
+            }, uiThreadExecutor).thenRunAsync(() -> {
+                try (ScopedSysTraceEvent e2 =
+                            ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync.doNetworkInitializations")) {
+                    assert ThreadUtils.runningOnUiThread();
+                    synchronized (mLock) {
+                        doNetworkInitializations(context);
+                        waitUntilSetUpResources();
+                    }
+                }
+            }, uiThreadExecutor).thenRunAsync(() -> {
+                try (ScopedSysTraceEvent e2 =
+                            ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync.configureChildProcessLauncher")) {
+                    assert ThreadUtils.runningOnUiThread();
+                    synchronized (mLock) {
+                        AwBrowserProcess.configureChildProcessLauncher();
+
+                        // finishVariationsInitLocked() must precede native initialization so the seed is
+                        // available when AwFeatureListCreator::SetUpFieldTrials() runs.
+                        finishVariationsInitLocked();
+                    }
+                }
+            }, uiThreadExecutor).thenComposeAsync((Void empty) -> {
+                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync.startAsync")) {
+                    assert ThreadUtils.runningOnUiThread();
+                    synchronized (mLock) {
+                        return AwBrowserProcess.startAsync();
+                    }
+                }
+            }, uiThreadExecutor).thenRunAsync(() -> {
+                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync.postStart")) {
+                    synchronized (mLock) {
+                        AwBrowserProcess.handleMinidumpsAndSetMetricsConsent(true /* updateMetricsConsent */);
+
+                        mSharedStatics = new SharedStatics();
+                        if (BuildInfo.isDebugAndroid()) {
+                            mSharedStatics.setWebContentsDebuggingEnabledUnconditionally(true);
+                        }
+
+                        mStarted = true;
+                    }
+                }
+            }, uiThreadExecutor).thenRunAsync(() -> {
+                try (ScopedSysTraceEvent e2 =
+                            ScopedSysTraceEvent.scoped("WebViewChromiumAwInit.startChromiumIncrementallyAsync.remainingWork")) {
+                    assert ThreadUtils.runningOnUiThread();
+                    synchronized (mLock) {
+                        RecordHistogram.recordSparseHistogram("Android.WebView.TargetSdkVersion",
+                                context.getApplicationInfo().targetSdkVersion);
+
+                        try (ScopedSysTraceEvent e = ScopedSysTraceEvent.scoped(
+                                    "WebViewChromiumAwInit.initThreadUnsafeSingletons")) {
+                            // Initialize thread-unsafe singletons.
+                            AwBrowserContext awBrowserContext = getBrowserContextOnUiThread();
+                            mGeolocationPermissions = new GeolocationPermissionsAdapter(
+                                    mFactory, awBrowserContext.getGeolocationPermissions());
+                            mWebStorage =
+                                    new WebStorageAdapter(mFactory, mBrowserContext.getQuotaManagerBridge());
+                            mAwTracingController = getTracingController();
+                            mServiceWorkerController = awBrowserContext.getServiceWorkerController();
+                            mAwProxyController = new AwProxyController();
+                        }
+
+                        mFactory.getRunQueue().drainQueue();
+
+                        if (CommandLine.getInstance().hasSwitch(AwSwitches.WEBVIEW_VERBOSE_LOGGING)) {
+                            logCommandLineAndActiveTrials();
+                        }
+                        mLock.notifyAll();
+                        mHasInitCompleted = true;
+                    }
+                }
+            }, uiThreadExecutor);
         }
     }
 
@@ -319,23 +479,27 @@ public class WebViewChromiumAwInit {
             return;
         }
 
-        // We must post to the UI thread to cover the case that the user has invoked Chromium
-        // startup by using the (thread-safe) CookieManager rather than creating a WebView.
-        AwThreadUtils.postToUiThreadLooper(new Runnable() {
-            @Override
-            public void run() {
-                synchronized (mLock) {
-                    startChromiumLocked();
-                }
+        final CompletableFuture<Void> chromiumStarted = new CompletableFuture<>();
+        AwThreadUtils.postToUiThreadLooper(() -> {
+            synchronized (mLock) {
+                startChromiumIncrementallyAsync().thenRunAsync(() -> {
+                    chromiumStarted.complete(null);
+                });
             }
         });
-        while (!mStarted) {
+        while (!mHasInitCompleted) {
             try {
                 // Important: wait() releases |mLock| the UI thread can take it :-)
                 mLock.wait();
             } catch (InterruptedException e) {
                 // Keep trying... eventually the UI thread will process the task we sent it.
             }
+        }
+        // Wait until the Future has resolved. It should resolve quickly after mHasInitCompleted becomes true.
+        try {
+            chromiumStarted.get();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
