@@ -21,7 +21,7 @@ void StartupTaskRunner::AddTask(StartupTask callback) {
   task_list_.push_back(std::move(callback));
 }
 
-void StartupTaskRunner::StartRunningTasksAsync() {
+void StartupTaskRunner::StartRunningTasksAsync(bool throttled) {
   DCHECK(proxy_.get());
   int result = 0;
   if (task_list_.empty()) {
@@ -31,7 +31,11 @@ void StartupTaskRunner::StartRunningTasksAsync() {
   } else {
     base::OnceClosure next_task =
         base::BindOnce(&StartupTaskRunner::WrappedTask, base::Unretained(this));
-    proxy_->PostNonNestableTask(FROM_HERE, std::move(next_task));
+    if (throttled) {
+      proxy_->PostNonNestableDelayedTask(FROM_HERE, std::move(next_task), base::TimeDelta::FromMilliseconds(16));
+    } else {
+      proxy_->PostNonNestableTask(FROM_HERE, std::move(next_task));
+    }
   }
 }
 

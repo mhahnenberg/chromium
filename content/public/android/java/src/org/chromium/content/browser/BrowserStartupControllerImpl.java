@@ -5,6 +5,7 @@
 package org.chromium.content.browser;
 
 import android.content.Context;
+import android.os.Handler;
 import android.os.StrictMode;
 
 import androidx.annotation.IntDef;
@@ -22,6 +23,7 @@ import org.chromium.base.library_loader.LibraryProcessType;
 import org.chromium.base.library_loader.LoaderErrors;
 import org.chromium.base.library_loader.ProcessInitException;
 import org.chromium.base.metrics.ScopedSysTraceEvent;
+import org.chromium.base.task.ChoreographedExecutor;
 import org.chromium.base.task.PostTask;
 import org.chromium.content.app.ContentMain;
 import org.chromium.content.browser.ServicificationStartupUma.ServicificationStartup;
@@ -33,6 +35,8 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 /**
  * Implementation of {@link BrowserStartupController}.
@@ -236,16 +240,18 @@ public class BrowserStartupControllerImpl implements BrowserStartupController {
     @Override
     public void startBrowserProcessesSync(
             @LibraryProcessType int libraryProcessType, boolean singleProcess) {
-        assertProcessTypeSupported(libraryProcessType);
+        try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("BrowserStartupController.startBrowserProcessesSync.prelude")) {
 
-        ServicificationStartupUma.getInstance().record(ServicificationStartupUma.getStartupMode(
-                mFullBrowserStartupDone, mMinimalBrowserStarted, false /* startMinimalBrowser */));
+            assertProcessTypeSupported(libraryProcessType);
+
+            ServicificationStartupUma.getInstance().record(ServicificationStartupUma.getStartupMode(
+                    mFullBrowserStartupDone, mMinimalBrowserStarted, false /* startMinimalBrowser */));
+        }
 
         // If already started skip to checking the result
         if (!mFullBrowserStartupDone) {
             if (!mHasStartedInitializingBrowserProcess || !mPostResourceExtractionTasksCompleted) {
-                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped(
-                             "BrowserStartupController.prepareToStartBrowserProcess")) {
+                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("BrowserStartupController.prepareToStartBrowserProcess")) {
                     prepareToStartBrowserProcess(singleProcess, null);
                 }
             }
@@ -277,25 +283,106 @@ public class BrowserStartupControllerImpl implements BrowserStartupController {
         }
     }
 
+    private CompletableFuture<Void> asyncAwaitBrowserStartupDone(final CompletableFuture<Void> future) {
+        assert ThreadUtils.runningOnUiThread();
+        if (mFullBrowserStartupDone) {
+            future.complete(null);
+        } else {
+            ThreadUtils.postOnUiThread(() -> {
+                asyncAwaitBrowserStartupDone(future);
+            });
+        }
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<Void> startBrowserProcessesIncrementallyAsync(
+            @LibraryProcessType int libraryProcessType, boolean singleProcess) {
+        assert ThreadUtils.runningOnUiThread();
+
+        try (ScopedSysTraceEvent e = ScopedSysTraceEvent.scoped("BrowserStartupController.startBrowserProcessesAsync.preludeAsync")) {
+            assertProcessTypeSupported(libraryProcessType);
+
+            ServicificationStartupUma.getInstance().record(ServicificationStartupUma.getStartupMode(
+                mFullBrowserStartupDone, mMinimalBrowserStarted, false /* startMinimalBrowser */));
+        }
+
+        if (!mFullBrowserStartupDone) {
+            if (mHasStartedInitializingBrowserProcess) {
+                // TODO: Figure out what to do for mPostResourceExtractionTasksCompleted
+                return asyncAwaitBrowserStartupDone(new CompletableFuture<>());
+            }
+            mHasStartedInitializingBrowserProcess = true;
+
+            final Executor uiThreadExecutor = ChoreographedExecutor.getInstance(ThreadUtils.getUiThreadHandler());
+    
+            return CompletableFuture.supplyAsync(() -> {
+                assert ThreadUtils.runningOnUiThread();
+                try (ScopedSysTraceEvent e = ScopedSysTraceEvent.scoped("BrowserStartupController.prepareToStartBrowserProcessAsync")) {
+                    prepareToStartBrowserProcess(singleProcess, null);
+                }
+                try (ScopedSysTraceEvent e = ScopedSysTraceEvent.scoped("BrowserStartupController.contentStartAsync")) {
+                    if (!mHasCalledContentStart) {
+                        mCurrentBrowserStartType = BrowserStartType.FULL_BROWSER;
+                        if (contentStart() > 0) {
+                            // Failed. The callbacks may not have run, so run them.
+                            enqueueCallbackExecution(STARTUP_FAILURE);
+                            return false;
+                        }
+                    } else if (mCurrentBrowserStartType == BrowserStartType.MINIMAL_BROWSER) {
+                        mCurrentBrowserStartType = BrowserStartType.FULL_BROWSER;
+                        if (contentStart() > 0) {
+                            enqueueCallbackExecution(STARTUP_FAILURE);
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
+            }, uiThreadExecutor).thenComposeAsync((startedSuccessfully) -> {
+                assert ThreadUtils.runningOnUiThread();
+                try (ScopedSysTraceEvent e = ScopedSysTraceEvent.scoped("BrowserStartupController.flushStartupTasksAsync")) {
+                    if (startedSuccessfully) {
+                        // We don't need to manually flush startup tasks synchronously because the browser's init starts flushing them,
+                        // so we just need to wait until we get a callback from the browser indicating it's done starting up.
+                        return asyncAwaitBrowserStartupDone(new CompletableFuture<>());
+                    }
+                    return CompletableFuture.completedFuture(null);
+                }
+            }, uiThreadExecutor);
+        }
+
+        assert mFullBrowserStartupDone;
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        if (mStartupSuccess) {
+            result.complete(null);
+        } else {
+            result.completeExceptionally(new ProcessInitException(LoaderErrors.NATIVE_STARTUP_FAILED));
+        }
+        return result;
+    }
+
     /**
      * Start the browser process by calling ContentMain.start().
      */
     int contentStart() {
-        int result = 0;
-        if (mContentMainCallbackForTests == null) {
-            boolean startMinimalBrowser =
-                    mCurrentBrowserStartType == BrowserStartType.MINIMAL_BROWSER;
-            result = contentMainStart(startMinimalBrowser);
-            // No need to launch the full browser again if we are launching full browser now.
-            if (!startMinimalBrowser) mLaunchFullBrowserAfterMinimalBrowserStart = false;
-        } else {
-            assert mCurrentBrowserStartType == BrowserStartType.FULL_BROWSER;
-            // Run the injected Runnable instead of ContentMain().
-            mContentMainCallbackForTests.run();
-            mLaunchFullBrowserAfterMinimalBrowserStart = false;
+        try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("BrowserStartupController.contentStart")) {
+           int result = 0;
+            if (mContentMainCallbackForTests == null) {
+                boolean startMinimalBrowser =
+                        mCurrentBrowserStartType == BrowserStartType.MINIMAL_BROWSER;
+                result = contentMainStart(startMinimalBrowser);
+                // No need to launch the full browser again if we are launching full browser now.
+                if (!startMinimalBrowser) mLaunchFullBrowserAfterMinimalBrowserStart = false;
+            } else {
+                assert mCurrentBrowserStartType == BrowserStartType.FULL_BROWSER;
+                // Run the injected Runnable instead of ContentMain().
+                mContentMainCallbackForTests.run();
+                mLaunchFullBrowserAfterMinimalBrowserStart = false;
+            }
+            mHasCalledContentStart = true;
+            return result;
         }
-        mHasCalledContentStart = true;
-        return result;
     }
 
     @Override
@@ -314,7 +401,9 @@ public class BrowserStartupControllerImpl implements BrowserStartupController {
 
     @VisibleForTesting
     void flushStartupTasks() {
-        BrowserStartupControllerImplJni.get().flushStartupTasks();
+        try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("BrowserStartupController.flushStartupTasks")) {
+            BrowserStartupControllerImplJni.get().flushStartupTasks();
+        }
     }
 
     @Override
@@ -456,17 +545,23 @@ public class BrowserStartupControllerImpl implements BrowserStartupController {
             StrictMode.setThreadPolicy(oldPolicy);
         }
 
+        Log.i("FIRST_FRAG", "LibraryLoader done");
+
         Runnable postResourceExtraction = new Runnable() {
             @Override
             public void run() {
+                Log.i("FIRST_FRAG", "postResourceExtraction");
                 if (!mPostResourceExtractionTasksCompleted) {
                     // TODO(yfriedman): Remove dependency on a command line flag for this.
                     DeviceUtilsImpl.addDeviceSpecificUserAgentSwitch();
                     BrowserStartupControllerImplJni.get().setCommandLineFlags(singleProcess);
+                    Log.i("FIRST_FRAG", "after JNI setCommandLineFlags");
                     mPostResourceExtractionTasksCompleted = true;
                 }
 
+                Log.i("FIRST_FRAG", "before completion callback");
                 if (completionCallback != null) completionCallback.run();
+                Log.i("FIRST_FRAG", "after completion callback");
             }
         };
 
@@ -474,6 +569,7 @@ public class BrowserStartupControllerImpl implements BrowserStartupController {
         if (completionCallback == null) {
             // If no continuation callback is specified, then force the resource extraction
             // to complete.
+            Log.i("FIRST_FRAG", "ResourceExtractor");
             ResourceExtractor.get().waitForCompletion();
             postResourceExtraction.run();
         } else {

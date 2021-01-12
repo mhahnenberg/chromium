@@ -8,6 +8,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
@@ -42,6 +43,7 @@ import org.chromium.base.library_loader.LibraryLoader;
 import org.chromium.base.library_loader.LibraryProcessType;
 import org.chromium.base.metrics.RecordHistogram;
 import org.chromium.base.metrics.ScopedSysTraceEvent;
+import org.chromium.base.task.ChoreographedExecutor;
 import org.chromium.base.task.PostTask;
 import org.chromium.base.task.TaskRunner;
 import org.chromium.base.task.TaskTraits;
@@ -57,6 +59,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -127,22 +131,30 @@ public final class AwBrowserProcess {
      */
     public static void start() {
         try (ScopedSysTraceEvent e1 = ScopedSysTraceEvent.scoped("AwBrowserProcess.start")) {
-            final Context appContext = ContextUtils.getApplicationContext();
-            AwBrowserProcessJni.get().setProcessNameCrashKey(ContextUtils.getProcessName());
-            AwDataDirLock.lock(appContext);
+            Context tempAppContext = null;
+            try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.start.lockDataDir")) {
+                tempAppContext = ContextUtils.getApplicationContext();
+                AwBrowserProcessJni.get().setProcessNameCrashKey(ContextUtils.getProcessName());
+                AwDataDirLock.lock(tempAppContext);
+            }
+            final Context appContext = tempAppContext;
             // We must post to the UI thread to cover the case that the user
             // has invoked Chromium startup by using the (thread-safe)
             // CookieManager rather than creating a WebView.
             ThreadUtils.runOnUiThreadBlocking(() -> {
-                boolean multiProcess =
-                        CommandLine.getInstance().hasSwitch(AwSwitches.WEBVIEW_SANDBOXED_RENDERER);
-                if (multiProcess) {
-                    ChildProcessLauncherHelper.warmUp(appContext, true);
+                boolean multiProcess = false;
+                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.start.checkMultiProcess")) {
+                    multiProcess = CommandLine.getInstance().hasSwitch(AwSwitches.WEBVIEW_SANDBOXED_RENDERER);
+                    if (multiProcess) {
+                        ChildProcessLauncherHelper.warmUp(appContext, true);
+                    }
                 }
                 // The policies are used by browser startup, so we need to register the policy
                 // providers before starting the browser process. This only registers java objects
                 // and doesn't need the native library.
-                CombinedPolicyProvider.get().registerProvider(new AwPolicyProvider(appContext));
+                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.start.registerPolicyProvider")) {
+                    CombinedPolicyProvider.get().registerProvider(new AwPolicyProvider(appContext));
+                }
 
                 // Check android settings but only when safebrowsing is enabled.
                 try (ScopedSysTraceEvent e2 =
@@ -158,6 +170,49 @@ public final class AwBrowserProcess {
 
                 PowerMonitor.create();
             });
+        }
+    }
+
+    public static CompletableFuture<Void> startAsync() {
+        assert ThreadUtils.runningOnUiThread();
+        final Executor uiThreadExecutor = ChoreographedExecutor.getInstance(ThreadUtils.getUiThreadHandler());
+
+        try (ScopedSysTraceEvent e1 = ScopedSysTraceEvent.scoped("AwBrowserProcess.startAsync")) {
+            Context appContext = null;
+            try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.startAsync.lockDataDir")) {
+                appContext = ContextUtils.getApplicationContext();
+                AwBrowserProcessJni.get().setProcessNameCrashKey(ContextUtils.getProcessName());
+                AwDataDirLock.lock(appContext);
+            }
+            boolean tempMultiProcess = false;
+            try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.startAsync.checkMultiProcess")) {
+                tempMultiProcess = CommandLine.getInstance().hasSwitch(AwSwitches.WEBVIEW_SANDBOXED_RENDERER);
+                if (tempMultiProcess) {
+                    ChildProcessLauncherHelper.warmUp(appContext, true);
+                }
+            }
+            final boolean multiProcess = tempMultiProcess;
+            // The policies are used by browser startup, so we need to register the policy
+            // providers before starting the browser process. This only registers java objects
+            // and doesn't need the native library.
+            try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.startAsync.registerPolicyProvider")) {
+                CombinedPolicyProvider.get().registerProvider(new AwPolicyProvider(appContext));
+            }
+
+            // Check android settings but only when safebrowsing is enabled.
+            try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.startAsync.maybeEnable")) {
+                AwSafeBrowsingConfigHelper.maybeEnableSafeBrowsingFromManifest(appContext);
+            }
+
+            return CompletableFuture.runAsync(() -> {
+                assert ThreadUtils.runningOnUiThread();
+                try (ScopedSysTraceEvent e2 = ScopedSysTraceEvent.scoped("AwBrowserProcess.startAsync.startBrowserProcessesIncrementallyAsync")) {
+                    BrowserStartupController.getInstance().startBrowserProcessesIncrementallyAsync(
+                            LibraryProcessType.PROCESS_WEBVIEW, !multiProcess);
+                }
+
+                PowerMonitor.create();
+            }, uiThreadExecutor);
         }
     }
 
